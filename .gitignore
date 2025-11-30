@@ -1,0 +1,80 @@
+# Python cache / bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+*.pt
+*.bin
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environment / Conda
+env/
+venv/
+.venv/
+*.conda
+*.env
+*.DS_Store
+
+# Miniconda / Anaconda environment folders
+miniconda3/
+anaconda3/
+
+# VSCode remote SSH / workspace
+.vscode/
+.history/
+*.code-workspace
+
+# Dataset & tokenizer cache
+# (HuggingFace datasets, tokenizers, transformers)
+data/
+datasets/
+.cache/
+**/dataset.arrow
+**/cache-*
+**/tokenizer.json
+**/tokenizer.model
+
+# HuggingFace cache (if accidentally located in project)
+huggingface/
+HuggingFace/
+
+# Experiment results & logs
+experiments/
+results/
+logs/
+*.log
+*.jsonl
+
+# TensorBoard
+runs/
+
+# Torch compile artifacts
+torch_compile/
+torchinductor_cache/
+.triton/
+.triton_cache/
+# Inductor sometimes stores compiled dlls
+__compiled__/
+
+
+# Checkpoints / weights
+checkpoints/
+*.ckpt
+*.safetensors
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS generated files
+*.swp
+*.swo
+*.tmp
+Thumbs.db
+.DS_Store
