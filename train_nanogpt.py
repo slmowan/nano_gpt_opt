@@ -1,4 +1,3 @@
-
 import math
 import torch
 import torch.nn as nn
@@ -20,15 +19,12 @@ from transformers import get_cosine_schedule_with_warmup
 from transformers import AutoTokenizer
 from torch.utils.data import IterableDataset, get_worker_info
 
-# Import our custom optimizers
+# custom optimizers
 from rmsprop_optimizer import RMSProp
 from sgd_momentum_optimizer import SGDMomentum
 
 
-# ============================================================================
-# Model Architecture Components (from reference notebook)
-# ============================================================================
-
+# Model architecture: nanogpt
 class LayerNorm(nn.Module):
     """LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False"""
     def __init__(self, ndim, bias):
@@ -201,10 +197,7 @@ class GPT(nn.Module):
         return logits, loss
 
 
-# ============================================================================
-# Adam Optimizer (from reference notebook)
-# ============================================================================
-
+# Adam Optimizer (baseline): https://optimai-lab.github.io/LLM-OPT/lectures/Chapter3/LLM.html#llm-training
 class Adam(torch.optim.Optimizer):
     """Implements Adam algorithm with weight decay fix."""
     
@@ -273,10 +266,7 @@ class Adam(torch.optim.Optimizer):
         return loss
 
 
-# ============================================================================
-# Data Loading
-# ============================================================================
-
+# Dataset class
 class PreprocessedIterableDataset(IterableDataset):
     def __init__(self, data, tokenizer, device_batch_size, max_length):
         super().__init__()
@@ -308,10 +298,8 @@ class PreprocessedIterableDataset(IterableDataset):
         return input_ids
 
 
-# ============================================================================
-# Evaluation
-# ============================================================================
 
+# Evaluation
 def collate_fn(batch_list):
     batch = torch.stack([torch.Tensor(example["input_ids"]).long() for example in batch_list])
     return batch
@@ -341,69 +329,48 @@ def preprocess_batched(batch, tokenizer, max_length):
 
 
 @torch.no_grad()
-def evaluate_model(model, val_data, tokenizer, max_length, pad_idx, device, batch_size):
-    """Evaluate model on validation set (local dataset version)."""
-    from torch.utils.data import Dataset as TorchDataset, DataLoader
-    
-    class LocalValDataset(TorchDataset):
-        def __init__(self, data, tokenizer, max_length):
-            self.data = data
-            self.tokenizer = tokenizer
-            self.max_length = max_length
-        
-        def __len__(self):
-            return len(self.data)
-        
-        def __getitem__(self, idx):
-            example = self.data[idx]
-            tokenized = self.tokenizer(
-                example["text"],
-                max_length=self.max_length,
-                truncation=True,
-                padding="max_length",
-                return_tensors="pt",
-            )
-            return tokenized["input_ids"].squeeze(0)
-    
-    val_dataset = LocalValDataset(val_data, tokenizer, max_length)
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=True
+def evaluate_model(model, val_data, preprocess_batched, pad_idx, device, batch_size):
+    val_data = val_data.shuffle(seed=42)
+
+    val_data_mapped = val_data.map(
+        preprocess_batched,
+        batched=True,
+        remove_columns=["text", "timestamp", "url"],
     )
-    
-    target_eval_tokens = 1_000_000
+    val_data_mapped.batch = lambda batch_size: batch_fn(
+        val_data_mapped, batch_size
+    )
+
+    target_eval_tokens = 1_000_000 
     evaluated_on_tokens = 0
     total_loss = torch.tensor(0.0).to(device)
     total_batches = 0
-    
-    for batch in val_loader:
+
+    for batch in val_data_mapped.batch(batch_size=batch_size):
         if evaluated_on_tokens > target_eval_tokens:
             break
         total_batches += 1
-        
+
         input_ids = batch.to(device)
         labels = input_ids.clone()
         labels[:, :-1] = input_ids[:, 1:]
         labels[:, -1] = pad_idx
         labels[labels == pad_idx] = -100
         labels = labels.to(device)
-        
+
         _, loss = model(input_ids, targets=labels)
         total_loss += loss.detach()
+
         evaluated_on_tokens += (batch != pad_idx).sum().item()
-    
+
     total_loss = total_loss / total_batches
+
     return total_loss, evaluated_on_tokens
 
 
 
-# ============================================================================
-# Training Function
-# ============================================================================
 
+# Training
 def train_model(
     optimizer_name,
     optimizer,
@@ -436,7 +403,7 @@ def train_model(
     eval_losses = []
     eval_perplexities = []
     
-    # Training loop
+    # Start of training loop
     for batch_idx, batch in enumerate(dataloader):
         global_step += 1
         
@@ -450,10 +417,9 @@ def train_model(
         labels[:, -1] = pad_idx
         labels[labels == pad_idx] = -100
         labels = labels.to(device)
-        
         tokens_seen += (input_ids != pad_idx).sum().item()
         
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16): # automatic mixed precision
             logits, loss = model(input_ids, targets=labels)
         
         scaled_loss = loss / gradient_accumulation
@@ -473,14 +439,21 @@ def train_model(
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad()
+
         update_step += 1
         
-        # Evaluation
         if eval_every > 0 and ((update_step % eval_every == 0) or (update_step == num_training_steps)):
             model.eval()
+
             total_loss, evaluated_on_tokens = evaluate_model(
-                model, val_data, tokenizer, max_length, pad_idx, device, device_batch_size
+                model, 
+                val_data,
+                lambda x: preprocess_batched(x, tokenizer, max_length),
+                pad_idx,
+                device,
+                device_batch_size,
             )
+
             model.train()
             
             total_loss_value = total_loss.detach().cpu().item()
@@ -504,10 +477,7 @@ def train_model(
     }
 
 
-# ============================================================================
 # Main Experiment Runner
-# ============================================================================
-
 def run_experiment(optimizer_name, lr, device, output_dir):
     """
     Run a single training experiment with specified optimizer and learning rate.
@@ -522,10 +492,10 @@ def run_experiment(optimizer_name, lr, device, output_dir):
     logger.info(f"Running experiment: {optimizer_name} with lr={lr}")
     logger.info(f"{'='*80}\n")
     
-    # ========== Configuration ==========
-    device_batch_size = 1
+    # Configuration
+    device_batch_size = 64
     max_length = 256
-    num_training_steps = 5000
+    num_training_steps = 5000 # so that training budget is 330M tokens
     total_batch_size = 256
     grad_clipping = 0.0
     print_freq = 100
@@ -536,64 +506,73 @@ def run_experiment(optimizer_name, lr, device, output_dir):
     
     gradient_accumulation = total_batch_size // device_batch_size
     
-    # ========== Load Data from Local ==========
-    logger.info("Loading dataset from local directory...")
-    
-    # 检查本地数据是否存在
-    data_dir = Path("./data/c4")
-    train_data_path = data_dir / "train"
-    val_data_path = data_dir / "validation"
-    
-    if not train_data_path.exists() or not val_data_path.exists():
-        logger.error(f"Local data not found at {data_dir}")
-        logger.error("Please run 'python download_data.py' first to download the dataset")
-        raise FileNotFoundError(f"Data directory not found: {data_dir}")
-    
+    # Load data via streaming
+    logger.info("Loading C4 with streaming=True ...")
+
+    data = load_dataset(
+        "allenai/c4", "en", split="train", streaming=True
+    )
+    # val_data = load_dataset(
+    #     "allenai/c4", "en", split="validation", streaming=True
+    # )
     from datasets import load_from_disk
-    data = load_from_disk(str(train_data_path))
-    val_data = load_from_disk(str(val_data_path))
+    val_data = load_from_disk("./data/c4/validation")
+
+    logger.info("C4 streaming dataset loaded successfully.")
     
-    logger.info(f"Loaded {len(data):,} training samples")
-    logger.info(f"Loaded {len(val_data):,} validation samples")
-    
-    # ========== Tokenizer ==========
+    # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
     pad_idx = tokenizer.pad_token_id
     
-    # ========== Dataset and DataLoader ==========
-    from torch.utils.data import Dataset as TorchDataset
-    
-    class LocalPreprocessedDataset(TorchDataset):
-        def __init__(self, data, tokenizer, max_length):
+    # Preprocessed iterable dataset
+    class PreprocessedIterableDataset(IterableDataset):
+        def __init__(self, data, tokenizer, device_batch_size, max_length):
+            super().__init__()
             self.data = data
             self.tokenizer = tokenizer
+            self.device_batch_size = device_batch_size
             self.max_length = max_length
-        
-        def __len__(self):
-            return len(self.data)
-        
-        def __getitem__(self, idx):
-            example = self.data[idx]
-            tokenized = self.tokenizer(
-                example["text"],
-                max_length=self.max_length,
-                truncation=True,
-                padding="max_length",
-                return_tensors="pt",
-            )
-            return tokenized["input_ids"].squeeze(0)
-    
-    dataset = LocalPreprocessedDataset(data, tokenizer, max_length=max_length)
+
+        def __iter__(self):
+            iter_data = iter(self.data)
+            batch = []
+
+            for example in iter_data:
+                tokenized = self.tokenizer(
+                    example["text"],
+                    max_length=self.max_length,
+                    truncation=True,
+                    padding="max_length",
+                    return_tensors="pt",
+                )
+                batch.append(tokenized)
+                if len(batch) == self.device_batch_size:
+                    yield self._format_batch(batch)
+                    batch = []
+
+            if batch:
+                yield self._format_batch(batch)
+
+        def _format_batch(self, batch):
+            input_ids = torch.stack([item["input_ids"].squeeze(0) for item in batch])
+            return input_ids
+
+    # create dataset and dataloader        
+    dataset = PreprocessedIterableDataset(
+        data,
+        tokenizer,
+        device_batch_size=device_batch_size,
+        max_length=max_length,
+    )
+
     dataloader = torch.utils.data.DataLoader(
-        dataset, 
-        batch_size=device_batch_size, 
-        shuffle=True,  # 打乱顺序
+        dataset,
+        batch_size=None,
         num_workers=workers,
-        pin_memory=True,  # 加速数据传输到GPU
     )
     
-    # ========== Model ==========
+    # model configuration
     logger.info("Initializing model...")
     n_layer = 12
     n_head = 12
@@ -609,12 +588,12 @@ def run_experiment(optimizer_name, lr, device, output_dir):
     )
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf).to(device)
-    # model = torch.compile(model)
-    model = model
+    model = torch.compile(model) # for faster training
+    # model = model
     
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     
-    # ========== Optimizer ==========
+    # optimizer
     logger.info(f"Initializing {optimizer_name} optimizer with lr={lr}...")
     
     if optimizer_name == 'adam':
@@ -626,7 +605,7 @@ def run_experiment(optimizer_name, lr, device, output_dir):
     else:
         raise ValueError(f"Unknown optimizer: {optimizer_name}")
     
-    # ========== LR Scheduler ==========
+    # Learning rate scheduler
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
@@ -634,7 +613,6 @@ def run_experiment(optimizer_name, lr, device, output_dir):
         last_epoch=-1,
     )
     
-    # ========== Training Config ==========
     training_config = {
         'num_training_steps': num_training_steps,
         'gradient_accumulation': gradient_accumulation,
@@ -646,7 +624,7 @@ def run_experiment(optimizer_name, lr, device, output_dir):
         'max_length': max_length,
     }
     
-    # ========== Train ==========
+    # Train
     model.train()
     history = train_model(
         optimizer_name=f"{optimizer_name}_lr{lr}",
@@ -660,7 +638,7 @@ def run_experiment(optimizer_name, lr, device, output_dir):
         config=training_config
     )
     
-    # ========== Save Results ==========
+    # save results
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
@@ -670,8 +648,8 @@ def run_experiment(optimizer_name, lr, device, output_dir):
     
     logger.info(f"Results saved to {result_file}")
     
-    # ========== Clean up memory ==========
-    # Delete model and optimizer to free GPU memory
+    # clean up memory
+    # delete model and optimizer to free GPU memory
     del model
     del optimizer
     del scheduler
@@ -686,10 +664,7 @@ def run_experiment(optimizer_name, lr, device, output_dir):
     return history
 
 
-# ============================================================================
-# Main
-# ============================================================================
-
+# Main: run all experiments
 def main():
     """
     Main function to run all experiments.
